@@ -27,7 +27,7 @@ class MLICPlusPlus(CompressionModel):
         self.slice_ch = slice_ch
 
         self.g_a = AnalysisTransform(N=N, M=M)
-        self.g_s = SynthesisTransform(N=N, M=M)
+        self.g_s = SynthesisTransformOld(N=N, M=M)
 
         self.h_a = HyperAnalysis(M=M, N=N)
         self.h_s = HyperSynthesis(M=M, N=N)
@@ -67,11 +67,11 @@ class MLICPlusPlus(CompressionModel):
 
         # Latent Residual Prediction
         self.lrp_anchor = nn.ModuleList(
-            LatentResidualPrediction(in_dim=M + (i + 1) * slice_ch, out_dim=slice_ch)
+            LatentResidualPredictionOld(in_dim=M + (i + 1) * slice_ch, out_dim=slice_ch)
             for i in range(slice_num)
         )
         self.lrp_nonanchor = nn.ModuleList(
-            LatentResidualPrediction(in_dim=M + (i + 1) * slice_ch, out_dim=slice_ch)
+            LatentResidualPredictionOld(in_dim=M + (i + 1) * slice_ch, out_dim=slice_ch)
             for i in range(slice_num)
         )
 
@@ -279,12 +279,13 @@ class MLICPlusPlus(CompressionModel):
 
         cost_time = end_time - start_time
         return {
+            "y": y,
             "strings": [y_strings, z_strings],
             "shape": z.size()[-2:],
             "cost_time": cost_time
         }
 
-    def decompress(self, strings, shape):
+    def decompress(self, strings, shape, y):
         torch.cuda.synchronize()
         start_time = time.time()
         y_strings = strings[0][0]
@@ -361,7 +362,7 @@ class MLICPlusPlus(CompressionModel):
                 y_hat_slices.append(slice_nonanchor + slice_anchor)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y_hat)
+        x_hat = self.g_s(y)
         torch.cuda.synchronize()
         end_time = time.time()
 
