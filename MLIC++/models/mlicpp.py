@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -191,11 +192,14 @@ class MLICPlusPlus(CompressionModel):
             else:
                 self.local_context[i].update_resolution(H, W, next(self.parameters()).device, mask=self.local_context[0].attn_mask)
 
-    def compress(self, x):
+    def compress(self, x, y=None):
         torch.cuda.synchronize()
         start_time = time.time()
         self.update_resolutions(x.size(2) // 16, x.size(3) // 16)
-        y = self.g_a(x)
+        if y is None:
+            y = self.g_a(x)
+        else:
+            y = y
         z = self.h_a(y)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
@@ -211,6 +215,15 @@ class MLICPlusPlus(CompressionModel):
         symbols_list = []
         indexes_list = []
         y_strings = []
+
+        batch_size, num_channels, height, width = y.shape
+        uncompressed_bpp_per_channel = []
+        _, likelihoods_uncompressed = self.gaussian_conditional(y, hyper_scales, hyper_means, False)
+
+        for ch in range(likelihoods_uncompressed.shape[1]):
+            uncompressed_bpp = torch.log(likelihoods_uncompressed[:,ch,:,:]).sum() / (-math.log(2)* (height*width))
+            uncompressed_bpp_per_channel.append(round(uncompressed_bpp.item(),4))
+
 
         for idx, y_slice in enumerate(y_slices):
             slice_anchor, slice_nonanchor = ckbd_split(y_slice)
@@ -282,7 +295,8 @@ class MLICPlusPlus(CompressionModel):
             "y": y,
             "strings": [y_strings, z_strings],
             "shape": z.size()[-2:],
-            "cost_time": cost_time
+            "cost_time": cost_time,
+            "uncompressed_bpp": uncompressed_bpp_per_channel
         }
 
     def decompress(self, strings, shape, y):
@@ -292,6 +306,10 @@ class MLICPlusPlus(CompressionModel):
         z_strings = strings[1]
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         self.update_resolutions(z_hat.size(2) * 4, z_hat.size(3) * 4)
+
+        height = z_hat.size(2) * 4
+        width = z_hat.size(3) * 4
+
         hyper_params = self.h_s(z_hat)
         hyper_scales, hyper_means = hyper_params.chunk(2, 1)
         y_hat_slices = []
@@ -301,6 +319,8 @@ class MLICPlusPlus(CompressionModel):
         offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
         decoder = RansDecoder()
         decoder.set_stream(y_strings)
+
+        decompressed_bpp_per_channel = []
 
         for idx in range(self.slice_num):
             if idx == 0:
@@ -361,8 +381,16 @@ class MLICPlusPlus(CompressionModel):
                 slice_nonanchor = slice_nonanchor + ckbd_nonanchor(lrp_nonanchor)
                 y_hat_slices.append(slice_nonanchor + slice_anchor)
 
+            scales_slice = ckbd_merge(scales_anchor, scales_nonanchor)  # scales after merge
+            means_slice = ckbd_merge(means_anchor, means_nonanchor)
+            _,likelihoods = self.gaussian_conditional(slice_anchor + slice_nonanchor,scales_slice, means_slice, False)
+
+            for ch in range(likelihoods.shape[1]):
+                decompressed_bpp = torch.log(likelihoods[:,ch,:,:]).sum() / (-math.log(2)* (height*width))#-torch.sum(torch.log2(likelihoods_bfr[:,ch,:,:]))
+                decompressed_bpp_per_channel.append(round(decompressed_bpp.item(),4))
+
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y)
+        x_hat = self.g_s(y_hat)
         torch.cuda.synchronize()
         end_time = time.time()
 
@@ -370,7 +398,9 @@ class MLICPlusPlus(CompressionModel):
 
         return {
             "x_hat": x_hat,
-            "cost_time": cost_time
+            "cost_time": cost_time,
+            "y_hat": y_hat,
+            "decompressed_bpp": decompressed_bpp_per_channel
         }
 
     def load_state_dict(self, state_dict):
